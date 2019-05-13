@@ -33,9 +33,6 @@
   ([_ db-name table-name]            [test-catalog-name "default" (tx/db-qualified-table-name db-name table-name)])
   ([_ db-name table-name field-name] [test-catalog-name "default" (tx/db-qualified-table-name db-name table-name) field-name]))
 
-(defmethod sql.tx/qualify+quote-name :presto [driver & names]
-  (apply #'presto/quote+combine-names (apply sql.tx/qualified-name-components driver names)))
-
 (defn- field-base-type->dummy-value [field-type]
   ;; we need a dummy value for every base-type to make a properly typed SELECT statement
   (if (keyword? field-type)

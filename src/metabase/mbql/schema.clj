@@ -8,7 +8,8 @@
             [metabase.util
              [date :as du]
              [schema :as su]]
-            [schema.core :as s]))
+            [schema.core :as s]
+            [metabase.util :as u]))
 
 ;; A NOTE ABOUT METADATA:
 ;;
@@ -134,9 +135,14 @@
 
 (defclause field-literal, field-name su/NonBlankString, field-type su/FieldType)
 
+(defclause joined-field, alias su/NonBlankString, field (one-of field-id field-literal))
+
 ;; Both args in `[:fk-> <source-field> <dest-field>]` are implict `:field-ids`. E.g.
 ;;
 ;;   [:fk-> 10 20] --[NORMALIZE]--> [:fk-> [:field-id 10] [:field-id 20]]
+;;
+;; `fk->` clauses are automatically replaced by the Query Processor with appropriate `:joined-field` clauses during
+;; preprocessing. Drivers do not need to handle `:fk->` clauses themselves.
 (defclause ^{:requires-features #{:foreign-keys}} fk->
   source-field (one-of field-id field-literal)
   dest-field   (one-of field-id field-literal))
@@ -160,7 +166,7 @@
 ;;
 ;; Field is an implicit Field ID
 (defclause datetime-field
-  field (one-of field-id field-literal fk->)
+  field (one-of field-id field-literal fk-> joined-field)
   unit  DatetimeFieldUnit)
 
 ;; binning strategy can wrap any of the above clauses, but again, not another binning strategy clause
@@ -170,7 +176,7 @@
 
 (def BinnableField
   "Schema for any sort of field clause that can be wrapped by a `binning-strategy` clause."
-  (one-of field-id fk-> datetime-field field-literal))
+  (one-of field-id field-literal joined-field fk-> datetime-field))
 
 (def ResolvedBinningStrategyOptions
   "Schema for map of options tacked on to the end of `binning-strategy` clauses by the `binning` middleware."
@@ -189,10 +195,13 @@
   ;; replaced. Driver implementations can rely on this being populated
   resolved-options (optional ResolvedBinningStrategyOptions))
 
+(def ^:private Field*
+  (one-of field-id field-literal joined-field fk-> datetime-field expression binning-strategy))
+
 (def Field
   "Schema for anything that refers to a Field, from the common `[:field-id <id>]` to variants like `:datetime-field` or
   `:fk->` or an expression reference `[:expression <name>]`."
-  (one-of field-id field-literal fk-> datetime-field expression binning-strategy))
+  (s/recursive #'Field*))
 
 ;; aggregate field reference refers to an aggregation, e.g.
 ;;
@@ -509,32 +518,71 @@
     (set/rename-keys NativeQuery {:query :native})
     (s/recursive #'MBQLQuery)))
 
-(def JoinTableInfo
-  "Schema for information about a JOIN (or equivalent) that should be performed, and how to do it.. This is added
-  automatically by `resolve-joined-tables` middleware for `fk->` forms that are encountered."
-  { ;; The alias we should use for the table
-   :join-alias  su/NonBlankString
-   ;; ID of the Table to JOIN against. Table will be present in the QP store
-   :table-id    su/IntGreaterThanZero
-   ;; ID of the Field of the Query's SOURCE TABLE to use for the JOIN
-   ;; TODO - can `fk-field-id` and `pk-field-id` possibly be NAMES of FIELD LITERALS??
-   :fk-field-id su/IntGreaterThanZero
-   ;; ID of the Field on the Table we will JOIN (i.e., Table with `table-id`) to use for the JOIN
-   :pk-field-id su/IntGreaterThanZero})
+(def JoinStrategy
+  "Strategy that should be used to perform the equivalent of a SQL `JOIN` against another table or a nested query.
+  These correspond 1:1 to features of the same name in driver features lists; e.g. you should check that the current
+  driver supports `:full-join` before generating a Join clause using that strategy."
+  (s/enum :left-join :right-join :inner-join :full-join))
 
-(def JoinQueryInfo
-  "Schema for information about about a JOIN (or equivalent) that should be performed using a recursive MBQL or native
-  query."
-  ;; Similar to a `JoinTable` but instead of referencing a table, it references a query expression
-  (assoc JoinTableInfo
-    :query (s/recursive #'Query)))
+(def Join
+  "Perform the equivalent of a SQL `JOIN` with another Table or nested `:source-query`. JOINs are either explicitly
+  specified in the incoming query, or implicitly generated when one uses a `:fk->` clause.
 
-(def JoinInfo
-  "Schema for information about a JOIN (or equivalent) that needs to be performed, either `JoinTableInfo` or
-  `JoinQueryInfo`."
-  (s/if :query
-    JoinQueryInfo
-    JoinTableInfo))
+  In the top-level query, you can reference Fields from the joined table or nested query by the `:fk->` clause for
+  implicit joins; for explicit joins, you *must* specify `:alias` yourself; you can then reference Fields by using a
+  `:joined-field` clause, e.g.
+
+    [:joined-field \"my_join_alias\" [:field-id 1]]                 ; for joins against other Tabless
+    [:joined-field \"my_join_alias\" [:field-literal \"my_field\"]] ; for joins against nested queries"
+  (->
+   { ;; The condition on which to JOIN. Can be anything that is a valid `:filter` clause. For automatically-generated
+    ;; JOINs this is always
+    ;;
+    ;;    [:= <source-table-fk-field> [:joined-field <join-table-alias> <dest-table-pk-field>]]
+    ;;
+    :condition                     Filter
+    ;;
+    ;; *What* to JOIN. Self-joins can be done by using the same `:source-table` as in the query where this is specified.
+    ;; YOU MUST SUPPLY EITHER `:source-table` OR `:source-query`, BUT NOT BOTH!
+    (s/optional-key :source-table) su/IntGreaterThanZero
+    (s/optional-key :source-query) (s/recursive #'Query)
+    ;;
+    ;; Defaults to `:left-join`; used for all automatically-generated JOINs
+    ;;
+    ;; Driver implementations: this is guaranteed to be present after pre-processing.
+    (s/optional-key :strategy)     JoinStrategy
+    ;;
+    ;; The Fields to include in the results *if* a top-level `:fields` clause *is not* specified. This can be either
+    ;; `:none`, `:all`, or a sequence of Field clauses.
+    ;;
+    ;; *  `:none`: no Fields from the joined table or nested query are included (unless indirectly included by
+    ;;    breakouts or other clauses). This is the default, and what is used for automatically-generated joins.
+    ;;
+    ;; *  `:all`: will include all of the Fields from the joined table or query
+    ;;
+    ;; *  a sequence of Field clauses: include only the Fields specified. Valid clauses are the same as the top-level
+    ;;    `:fields` clause. This should be non-empty and all elements should be distinct. The normalizer will
+    ;;    automatically remove duplicate fields for you, and replace empty clauses with `:none`.
+    ;;
+    ;; Driver implementations: you can ignore this clause. Relevant fields will be added to top-level `:fields` clause
+    ;; with appropriate aliases.
+    (s/optional-key :fields)       (s/cond-pre
+                                    (s/enum :all :none)
+                                    (su/distinct (su/non-empty [Field])))
+    ;;
+    ;; The name used to alias the JOINed table or query. This is usually generated automatically and generally looks
+    ;; like `table__via__field`. You can specify this yourself if you need to reference a JOINed field in a
+    ;; `:joined-field` clause.
+    ;;
+    ;; Drivers implementations: This is guaranteed to be present after pre-processing.
+    (s/optional-key :alias)        su/NonBlankString
+    ;;
+    ;; put other stuff in here (such as an ID for UI purposes), we don't care
+    s/Keyword                      s/Any}
+   (s/constrained
+    (fn [{:keys [source-table source-query]}]
+      (u/xor source-table source-query))
+    "Joins can must have either a `source-table` or `source-query`, but not both.")))
 
 (def ^java.util.regex.Pattern source-table-card-id-regex
   "Pattern that matches `card__id` strings that can be used as the `:source-table` of MBQL queries."
@@ -544,9 +592,6 @@
   "Schema for a valid value for the `:source-table` clause of an MBQL query."
   (s/cond-pre su/IntGreaterThanZero source-table-card-id-regex))
 
-(defn- distinct-non-empty [schema]
-  (s/constrained schema (every-pred (partial apply distinct?) seq) "non-empty sequence of distinct items"))
-
 (def MBQLQuery
   "Schema for a valid, normalized MBQL [inner] query."
   (->
@@ -554,22 +599,22 @@
     (s/optional-key :source-table) SourceTable
     (s/optional-key :aggregation)  (su/non-empty [Aggregation])
     (s/optional-key :breakout)     (su/non-empty [Field])
-    ; TODO - expressions keys should be strings; fix this when we get a chance
+    ;; TODO - expressions keys should be strings; fix this when we get a chance
     (s/optional-key :expressions)  {s/Keyword FieldOrExpressionDef}
-    ;; TODO - should this be `distinct-non-empty`?
-    (s/optional-key :fields)       (su/non-empty [Field])
+    ;; For databases like MongoDB which use maps for projections we can't really fetch the same Field twice
+    (s/optional-key :fields)       (su/distinct (su/non-empty [Field]))
     (s/optional-key :filter)       Filter
     (s/optional-key :limit)        su/IntGreaterThanZero
-    (s/optional-key :order-by)     (distinct-non-empty [OrderBy])
+    (s/optional-key :order-by)     (su/distinct (su/non-empty [OrderBy]))
     ;; page = page num, starting with 1. items = number of items per page.
     ;; e.g.
     ;; {:page 1, :items 10} = items 1-10
     ;; {:page 2, :items 10} = items 11-20
     (s/optional-key :page)         {:page  su/IntGreaterThanZero
                                     :items su/IntGreaterThanZero}
+    (s/optional-key :joins)        (su/non-empty [Join])
     ;; Various bits of middleware add additonal keys, such as `fields-is-implicit?`, to record bits of state or pass
     ;; info to other pieces of middleware. Everyone else can ignore them.
-    (s/optional-key :join-tables)  (s/constrained [JoinInfo] (partial apply distinct?) "distinct JoinInfo")
     s/Keyword                      s/Any}
 
    (s/constrained
@@ -741,8 +786,6 @@
     ;; Info about the columns of the source query. Added in automatically by middleware. This metadata is primarily
     ;; used to let power things like binning when used with Field Literals instead of normal Fields
     (s/optional-key :source-metadata) (s/maybe [SourceQueryMetadata])
-    #_:fk-field-ids
-    #_:table-ids
     ;;
     ;; Other various keys get stuck in the query dictionary at some point or another by various pieces of QP
     ;; middleware to record bits of state. Everyone else can ignore them.

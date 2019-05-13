@@ -112,8 +112,7 @@
   "Used by `make-load-data-fn`; creates the actual `insert!` function that gets passed to the `insert-middleware-fns`
   described above."
   [driver conn {:keys [database-name], :as dbdef} {:keys [table-name], :as tabledef}]
-  (let [escaped-table-name (apply hx/qualify-and-escape-dots
-                                  (sql.tx/qualified-name-components driver database-name table-name))]
+  (let [escaped-table-name (apply hx/identifier (sql.tx/qualified-name-components driver database-name table-name))]
     (partial do-insert! driver conn escaped-table-name)))
 
 (defn make-load-data-fn
@@ -170,32 +169,13 @@
 ;;; |                                              CREATING DBS/TABLES                                               |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn- escape-field-names
-  "Escape the field-name keys in ROW-OR-ROWS."
-  [row-or-rows]
-  (if (sequential? row-or-rows)
-    (map escape-field-names row-or-rows)
-    (into {} (for [[k v] row-or-rows]
-               {(sql-jdbc.common/escape-field-name k) v}))))
-
 ;; default impl
 (defmethod do-insert! :sql-jdbc/test-extensions [driver spec table-name row-or-rows]
-  (let [prepare-key (comp keyword (partial sql.tx/prepare-identifier driver) name)
-        rows        (if (sequential? row-or-rows)
-                      row-or-rows
-                      [row-or-rows])
-        columns     (keys (first rows))
-        values      (for [row rows]
-                      (for [value (map row columns)]
-                        (sql.qp/->honeysql driver value)))
-        hsql-form   (-> (apply h/columns (for [column columns]
-                                           (hx/qualify-and-escape-dots (prepare-key column))))
-                        (h/insert-into (prepare-key table-name))
-                        (h/values values))
-        sql+args    (hx/unescape-dots (binding [hformat/*subquery?* false]
-                                        (hsql/format hsql-form
-                                          :quoting             (sql.qp/quote-style driver)
-                                          :allow-dashed-names? true)))]
+  (let [honeysql-form (ddl/insert-honeysql-form driver table-name row-or-rows)
+        sql+args      (binding [hformat/*subquery?* false]
+                        (hsql/format honeysql-form
+                          :quoting             (sql.qp/quote-style driver)
+                          :allow-dashed-names? true))]
     (try (jdbc/execute! spec sql+args)
          (catch SQLException e
            (println (u/format-color 'red "INSERT FAILED: \n%s\n" sql+args))
@@ -211,7 +191,7 @@
   ;; next, get a set of statements for creating the DB & Tables
   (let [statements (apply ddl/create-db-ddl-statements driver dbdef options)]
     ;; exec the combined statement
-    (execute/execute-sql! driver :db dbdef (str/join ";\n" (map hx/unescape-dots statements))))
+    (execute/execute-sql! driver :db dbdef (str/join ";\n" statements)))
   ;; Now load the data for each Table
   (doseq [tabledef table-definitions]
     (du/profile (format "load-data for %s %s %s" (name driver) (:database-name dbdef) (:table-name tabledef))

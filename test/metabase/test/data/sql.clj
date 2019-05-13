@@ -1,14 +1,13 @@
 (ns metabase.test.data.sql
   "Common test extension functionality for all SQL drivers."
-  (:require [clojure.string :as s]
-            [honeysql.format :as h.format]
-            [metabase
-             [driver :as driver]
-             [util :as u]]
-            [metabase.driver.sql.query-processor :as sql.qp]
+  (:require [metabase.driver :as driver]
             [metabase.test.data.interface :as tx]
+            [honeysql.format :as hformat]
+            [metabase.test.data.sql.honeysql :as thx]
+            [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.util.honeysql-extensions :as hx])
-  (:import metabase.test.data.interface.FieldDefinition))
+  (:import metabase.test.data.interface.FieldDefinition
+           honeysql.format.ToSql))
 
 (driver/register! :sql/test-extensions, :abstract? true)
 
@@ -62,45 +61,6 @@
   ([_ db-name table-name field-name] [table-name field-name]))
 
 
-(defn quote-name
-  "Quote an unqualified string or keyword identifier using `driver`'s implementation of `prepare-identifier` and its
-  `quote-style`.
-
-    (quote-name :mysql \"wow\") ; -> \"`wow`\"
-    (quote-name :h2 \"wow\")    ; -> \"\\\"WOW\\\"\""
-  [driver identifier]
-  (as-> identifier <>
-    (u/keyword->qualified-name <>)
-    (prepare-identifier driver <>)
-    (hx/escape-dots <>)
-    (binding [h.format/*allow-dashed-names?* true]
-      (h.format/quote-identifier <> :style (sql.qp/quote-style driver)))
-    (hx/unescape-dots <>)))
-
-
-;; TODO - what about schemas?
-(defmulti qualify+quote-name
-  "Qualify names and combine into a single, quoted name. By default, this combines the results of
-  `qualified-name-components`and `quote-name`.
-
-    (qualify+quote-name [driver \"my-db\" \"my-table\"]) -> \"my-db\".\"dbo\".\"my-table\""
-  {:arglists '([driver database-name table-name? field-name?])}
-  tx/dispatch-on-driver-with-test-extensions
-  :hierarchy #'driver/hierarchy)
-
-(defn- quote+combine-names [driver names]
-  (s/join \. (for [n names]
-               (name (hx/qualify-and-escape-dots (quote-name driver n))))))
-
-(defmethod qualify+quote-name :sql/test-extensions
-  ([driver db-name]
-   (quote+combine-names driver (qualified-name-components driver db-name)))
-  ([driver db-name table-name]
-   (quote+combine-names driver (qualified-name-components driver db-name table-name)))
-  ([driver db-name table-name field-name]
-   (quote+combine-names driver (qualified-name-components driver db-name table-name field-name))))
-
-
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Interface (Comments)                                              |
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -119,9 +79,9 @@
 
 (defn standard-inline-column-comment-sql
   "Implementation of `inline-column-comment-sql` for driver test extensions that wish to use it."
-  [_ field-comment]
-  (when (seq field-comment)
-    (format "COMMENT '%s'" field-comment)))
+  [driver field-comment]
+  (thx/format-honeysql driver (sql.qp/->honeysql driver
+                                (thx/inline-comment field-comment))))
 
 
 (defmulti standalone-column-comment-sql
@@ -197,8 +157,12 @@
   tx/dispatch-on-driver-with-test-extensions
   :hierarchy #'driver/hierarchy)
 
+
+
 (defmethod create-db-sql :sql/test-extensions [driver {:keys [database-name]}]
-  (format "CREATE DATABASE %s;" (qualify+quote-name driver database-name)))
+  (thx/format-honeysql driver
+    (thx/create-database
+     (sql.qp/->honeysql driver (hx/identifier "my_db")))))
 
 
 (defmulti drop-db-if-exists-sql
@@ -219,23 +183,23 @@
 
 (defmethod create-table-sql :sql/test-extensions
   [driver {:keys [database-name], :as dbdef} {:keys [table-name field-definitions table-comment]}]
-  (let [quot          (partial quote-name driver)
-        pk-field-name (quot (pk-field-name driver))]
-    (format "CREATE TABLE %s (%s, %s %s, PRIMARY KEY (%s)) %s;"
-            (qualify+quote-name driver database-name table-name)
-            (->> field-definitions
-                 (map (fn [{:keys [field-name base-type field-comment]}]
-                        (format "%s %s %s"
-                                (quot field-name)
-                                (if (map? base-type)
-                                  (:native base-type)
-                                  (field-base-type->sql-type driver base-type))
-                                (or (inline-column-comment-sql driver field-comment) ""))))
-                 (interpose ", ")
-                 (apply str))
-            pk-field-name (pk-sql-type driver)
-            pk-field-name
-            (or (inline-table-comment-sql driver table-comment) ""))))
+  (thx/format-honeysql driver
+    (thx/create-table
+     (sql.qp/->honeysql driver (apply hx/identifier (qualified-name-components driver database-name table-name)))
+
+     (concat
+      (for [{:keys [field-name base-type field-comment]} field-definitions]
+        (thx/create-table-field
+         (sql.qp/->honeysql driver (apply hx/identifier (qualified-name-components driver database-name table-name))))
+        (quot field-name)
+        (if (map? base-type)
+          (:native base-type)
+          (field-base-type->sql-type driver base-type))
+        (or (inline-column-comment-sql driver field-comment) ""))
+      [pk-field-name (pk-sql-type driver)
+       (thx/create-table-primary-key pk-field-name)])
+
+     (or (inline-table-comment-sql driver table-comment) ""))))
 
 
 (defmulti drop-table-if-exists-sql

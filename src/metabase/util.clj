@@ -701,3 +701,12 @@
   {:style/indent 0}
   [& body]
   `(do-with-us-locale (fn [] ~@body)))
+
+(defn xor
+  "Exclusive or. Hopefully this is self-explanatory ;)"
+  ([x y]
+   (and (or x y)
+        (not (and x y))))
+
+  ([x y & more]
+   (apply xor (xor x y) more)))

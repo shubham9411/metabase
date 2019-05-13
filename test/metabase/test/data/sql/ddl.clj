@@ -1,8 +1,10 @@
 (ns metabase.test.data.sql.ddl
   (:require [metabase.driver :as driver]
+            [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.test.data
              [interface :as tx]
-             [sql :as sql.tx]]))
+             [sql :as sql.tx]]
+            [metabase.util.honeysql-extensions :as hx]))
 
 (defmulti drop-db-ddl-statements
   "Return a sequence of DDL statements for dropping a DB using the multimethods in the SQL test extensons namespace, if
@@ -51,3 +53,23 @@
         (when field-comment
           (add! (sql.tx/standalone-column-comment-sql driver dbdef tabledef fielddef)))))
     @statements))
+
+
+(defmulti insert-honeysql-form
+  "Return appropriate HoneySQL for inserting `row-or-rows` into a DB."
+  {:arglists '([driver table-name row-or-rows])}
+  tx/dispatch-on-driver-with-test-extensions
+  :hierarchy #'driver/hierarchy)
+
+(defmethod insert-honeysql-form :sql/test-extensions
+  [driver table-name row-or-rows]
+  (let [prepare-key (comp hx/identifier (partial sql.tx/prepare-identifier driver) name)
+        rows        (if (sequential? row-or-rows)
+                      row-or-rows
+                      [row-or-rows])
+        columns     (keys (first rows))]
+    {:insert-into (prepare-key table-name)
+     :columns     (map prepare-key columns)
+     :values      (for [row rows]
+                    (for [value (map row columns)]
+                      (sql.qp/->honeysql driver value)))}))
