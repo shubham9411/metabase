@@ -3,12 +3,14 @@
   (:require [clojure.string :as str]
             [honeysql
              [core :as hsql]
-             [format :as hformat]])
+             [format :as hformat]]
+            [metabase.util.pretty :refer [PrettyPrintable]])
   (:import honeysql.format.ToSql
            java.util.Locale))
 
 (alter-meta! #'honeysql.core/format assoc :style/indent 1)
 (alter-meta! #'honeysql.core/call   assoc :style/indent 1)
+
 
 (defn- english-upper-case
   "Use this function when you need to upper-case an identifier or table name. Similar to `clojure.string/upper-case`
@@ -51,37 +53,29 @@
   clojure.lang.Ratio
   (to-sql [x] (hformat/to-sql (double x))))
 
-;; HoneySQL automatically assumes that dots within keywords are used to separate schema / table / field / etc. To
-;; handle weird situations where people actually put dots *within* a single identifier we'll replace those dots with
-;; lozenges, let HoneySQL do its thing, then switch them back at the last second
-;;
-;; TODO - Maybe instead of this lozengey hackiness it would make more sense just to add a new "identifier" record type
-;; that implements `ToSql` in a more intelligent way
-(defn escape-dots
-  "Replace dots in a string with WHITE MEDIUM LOZENGES (⬨)."
-  ^String [s]
-  (str/replace (name s) #"\." "⬨"))
+(defrecord Identifier [components]
+  :load-ns true
+  ToSql
+  (to-sql [_]
+    (binding [hformat/*allow-dashed-names?* true]
+      (str/join
+       \.
+       (for [component components
+             :when     (some? component)]
+         (hformat/quote-identifier component, :split false)))))
+  PrettyPrintable
+  (pretty [_]
+    (cons 'identifier components)))
 
-(defn qualify-and-escape-dots
-  "Combine several NAME-COMPONENTS into a single Keyword, and escape dots in each name by replacing them with WHITE
-  MEDIUM LOZENGES (⬨).
-
-     (qualify-and-escape-dots :ab.c :d) -> :ab⬨c.d"
-  ^clojure.lang.Keyword [& name-components]
-  (apply hsql/qualify (for [s name-components
-                            :when s]
-                        (escape-dots s))))
-
-(defn unescape-dots
-  "Unescape lozenge-escaped names in a final SQL string (or vector including params).
-   Use this to undo escaping done by `qualify-and-escape-dots` after HoneySQL compiles a statement to SQL."
-  ^String [sql-string-or-vector]
-  (when sql-string-or-vector
-    (if (string? sql-string-or-vector)
-      (str/replace sql-string-or-vector #"⬨" ".")
-      (vec (cons (unescape-dots (first sql-string-or-vector))
-                 (rest sql-string-or-vector))))))
-
+(defn identifier
+  "Define an identifer with `components`. Prefer this to using keywords for identifiers, as those do not properly handle
+  identifiers with slashes in them."
+  [& components]
+  (Identifier. (for [component components
+                     component (if (instance? Identifier component)
+                                 (:components component)
+                                 [component])]
+                 component)))
 
 ;; Single-quoted string literal
 (defrecord Literal [literal]

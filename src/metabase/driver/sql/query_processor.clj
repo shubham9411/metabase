@@ -1,5 +1,6 @@
 (ns metabase.driver.sql.query-processor
   "The Query Processor is responsible for translating the Metabase Query Language into HoneySQL SQL forms."
+  (:refer-clojure :exclude [alias])
   (:require [clojure.string :as str]
             [clojure.tools.logging :as log]
             [honeysql
@@ -22,7 +23,9 @@
             [metabase.util
              [honeysql-extensions :as hx]
              [i18n :refer [tru]]]
-            [schema.core :as s]))
+            [schema.core :as s]
+            [metabase.util.schema :as su])
+  (:import metabase.util.honeysql_extensions.Identifier))
 
 ;; TODO - yet another `*query*` dynamic var. We should really consolidate them all so we only need a single one.
 (def ^:dynamic *query*
@@ -161,36 +164,36 @@
     :type/UNIXTimestampMilliseconds (unix-timestamp->timestamp driver :milliseconds field-identifier)
     field-identifier))
 
+(def ^:dynamic *alias*
+  "Alias to use for qualifying Fields. Usually `nil`, but will be set for a joined Field."
+  nil)
+
+(defmethod ->honeysql [:sql metabase.util.honeysql_extensions.Identifier]
+  [_ identifier]
+  identifier)
+
 (defmethod ->honeysql [:sql (class Field)]
-  [driver field]
-  (let [table            (qp.store/table (:table_id field))
-        field-identifier (keyword (hx/qualify-and-escape-dots (:schema table) (:name table) (:name field)))]
+  [driver {field-name :name, table-id :table_id, :as field}]
+  (let [{schema :schema, table-name :name} (qp.store/table table-id)
+        field-identifier                   (->honeysql driver
+                                             (if *alias*
+                                               (hx/identifier *alias* field-name)
+                                               (hx/identifier schema table-name field-name)))]
     (cast-unix-timestamp-field-if-needed driver field field-identifier)))
 
 (defmethod ->honeysql [:sql :field-id]
   [driver [_ field-id]]
   (->honeysql driver (qp.store/field field-id)))
 
-(defmethod ->honeysql [:sql :fk->]
-  [driver [_ _ dest-field-clause :as fk-clause]]
-  ;; because the dest field needs to be qualified like `categories__via_category_id.name` instead of the normal
-  ;; `public.category.name` we will temporarily swap out the `categories` Table in the QP store for the duration of
-  ;; converting this `fk->` clause to HoneySQL. We'll remove the `:schema` and swap out the `:name` with the alias so
-  ;; other `->honeysql` impls (e.g. the `(class Field` one) will do the correct thing automatically without having to
-  ;; worry about the context in which they are being called
-  (qp.store/with-pushed-store
-    (when-let [{:keys [join-alias table-id]} (mbql.u/fk-clause->join-info *query* *nested-query-level* fk-clause)]
-      (when table-id
-        (qp.store/store-table! (assoc (qp.store/table table-id)
-                                 :schema nil
-                                 :name   join-alias
-                                 ;; for drivers that need to know these things, like Snowflake
-                                 :alias? true))))
-    (->honeysql driver dest-field-clause)))
-
 (defmethod ->honeysql [:sql :field-literal]
   [driver [_ field-name]]
-  (->honeysql driver (keyword (hx/escape-dots (name field-name)))))
+  ;; hx/identifier will ignore `nil` components
+  (->honeysql driver (hx/identifier *alias* field-name)))
+
+(defmethod ->honeysql [:sql :joined-field]
+  [driver [_ join-alias field]]
+  (binding [*alias* join-alias]
+    (->honeysql driver field)))
 
 (defmethod ->honeysql [:sql :datetime-field]
   [driver [_ field unit]]
@@ -298,14 +301,14 @@
 ;;; |                                            Field Aliases (AS Forms)                                            |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(s/defn ^:private qualified-alias :- (s/maybe s/Keyword)
+(s/defn ^:private qualified-alias :- (s/maybe Identifier)
   "Convert the given `field` to a stringified alias, for use in a SQL `AS` clause."
   [driver, field :- (class Field)]
   (some->> field
            (field->alias driver)
-           hx/qualify-and-escape-dots))
+           hx/identifier))
 
-(s/defn field-clause->alias :- (s/maybe s/Keyword)
+(s/defn field-clause->alias :- (s/maybe Identifier)
   "Generate an approriate alias (e.g., for use with SQL `AN`) for a Field clause of any type."
   [driver, field-clause :- mbql.s/Field]
   (let [expression-name (when (mbql.u/is-clause? :expression field-clause)
@@ -314,10 +317,11 @@
                           (mbql.u/field-clause->id-or-literal field-clause))
         field           (when (integer? id-or-name)
                           (qp.store/field id-or-name))]
-    (cond
-      expression-name      (keyword (hx/escape-dots expression-name))
-      field                (qualified-alias driver field)
-      (string? id-or-name) (keyword (hx/escape-dots id-or-name)))))
+    (->honeysql driver
+      (cond
+        expression-name      (hx/identifier expression-name)
+        field                (qualified-alias driver field)
+        (string? id-or-name) (hx/identifier id-or-name)))))
 
 (defn as
   "Generate HoneySQL for an `AS` form (e.g. `<form> AS <field>`) using the name information of a `field-clause`. The
@@ -354,7 +358,9 @@
     (let [form (h/merge-select
                 form
                 [(->honeysql driver ag)
-                 (hx/escape-dots (driver/format-custom-field-name driver (annotate/aggregation-name ag)))])]
+                 (->honeysql driver (hx/identifier
+                                     (driver/format-custom-field-name driver
+                                       (annotate/aggregation-name ag))))])]
       (if-not (seq more)
         form
         (recur form more)))))
@@ -444,27 +450,47 @@
 
 (declare build-honeysql-form)
 
-(defn- make-honeysql-join-clauses
-  "Returns a seq of honeysql join clauses, joining to `table-or-query-expr`. `jt-or-jq` can be either a `JoinTable` or
-  a `JoinQuery`"
-  [driver table-or-query-expr {:keys [join-alias fk-field-id pk-field-id]}]
-  (let [source-field (qp.store/field fk-field-id)
-        pk-field     (qp.store/field pk-field-id)]
-    [[table-or-query-expr (keyword join-alias)]
-     [:=
-      (->honeysql driver source-field)
-      (hx/qualify-and-escape-dots join-alias (:name pk-field))]]))
+(defmulti join->honeysql
+  "Compile a single MBQL `join` to HoneySQL."
+  {:arglists '([driver join]), :style/indent 1}
+  driver/dispatch-on-initialized-driver
+  :hierarchy #'driver/hierarchy)
 
-(s/defn ^:private join-info->honeysql
-  [driver , {:keys [query table-id], :as info} :- mbql.s/JoinInfo]
-  (if query
-    (make-honeysql-join-clauses driver (build-honeysql-form driver query) info)
-    (let [table (qp.store/table table-id)]
-      (make-honeysql-join-clauses driver (->honeysql driver table) info))))
+(defmulti join-source
+  "Generate HoneySQL for a table or query to be joined."
+  {:arglists '([driver join]), :style/indent 1}
+  driver/dispatch-on-initialized-driver
+  :hierarchy #'driver/hierarchy)
 
-(defmethod apply-top-level-clause [:sql :join-tables]
-  [driver _ honeysql-form {:keys [join-tables]}]
-  (reduce (partial apply h/merge-left-join) honeysql-form (map (partial join-info->honeysql driver) join-tables)))
+(defmethod join-source :sql
+  [driver {:keys [source-table source-query]}]
+  (if source-query
+    (build-honeysql-form driver source-query)
+    (->honeysql driver (qp.store/table source-table))))
+
+(s/defmethod join->honeysql :sql
+  [driver, {:keys [condition alias], :as join} :- mbql.s/Join]
+  (println "join MBQL:" (u/pprint-to-str 'yellow join)) ; NOCOMMIT
+  (u/prog1
+      [[(join-source driver join) alias] (->honeysql driver condition)]
+      (println "generated HoneySQL:" (u/pprint-to-str 'cyan <>)) ; NOCOMMIT
+      ))
+
+(def ^:private join-strategy->merge-fn
+  {:left-join  h/merge-left-join
+   :right-join h/merge-right-join
+   :inner-join h/merge-join
+   :full-join  h/merge-full-join})
+
+(defmethod apply-top-level-clause [:sql :joins]
+  [driver _ honeysql-form {:keys [joins]}]
+  (println "Joins MBQL ::" (u/pprint-to-str 'magenta joins)) ; NOCOMMIT
+  (s/validate mbql.s/Joins joins) ; NOCOMMIT
+  (reduce
+   (fn [honeysql-form {:keys [strategy], :as join}]
+     (apply (join-strategy->merge-fn strategy) honeysql-form (join->honeysql driver join)))
+   honeysql-form
+   joins))
 
 
 ;;; ---------------------------------------------------- order-by ----------------------------------------------------
@@ -494,9 +520,9 @@
 ;;; -------------------------------------------------- source-table --------------------------------------------------
 
 (defmethod ->honeysql [:sql (class Table)]
-  [_ table]
+  [driver table]
   (let [{table-name :name, schema :schema} table]
-    (hx/qualify-and-escape-dots schema table-name)))
+    (->honeysql driver (hx/identifier schema table-name))))
 
 (defmethod apply-top-level-clause [:sql :source-table]
   [driver _ honeysql-form {source-table-id :source-table}]
@@ -599,22 +625,22 @@
 ;;; |                                                 MBQL -> Native                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn honeysql-form->sql+args
+(s/defn honeysql-form->sql+args
   "Convert HONEYSQL-FORM to a vector of SQL string and params, like you'd pass to JDBC."
   {:style/indent 1}
-  [driver honeysql-form]
-  {:pre [(map? honeysql-form)]}
+  [driver, honeysql-form :- su/Map]
+  (println "(u/pprint-to-str 'blue honeysql-form):" (u/pprint-to-str 'blue honeysql-form)) ; NOCOMMIT
   (let [[sql & args] (try (binding [hformat/*subquery?* false]
                             (hsql/format honeysql-form
-                              :quoting             (quote-style driver)
-                              :allow-dashed-names? true))
+                                         :quoting             (quote-style driver)
+                                         :allow-dashed-names? true))
                           (catch Throwable e
                             (log/error (u/format-color 'red
                                            (str (tru "Invalid HoneySQL form:")
                                                 "\n"
                                                 (u/pprint-to-str honeysql-form))))
                             (throw e)))]
-    (into [(hx/unescape-dots sql)] args)))
+    (into [sql] args)))
 
 (defn mbql->native
   "Transpile MBQL query into a native SQL statement."

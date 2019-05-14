@@ -1,8 +1,9 @@
 (ns metabase.util.honeysql-extensions-test
-  (:require [expectations :refer :all]
+  (:require [expectations :refer [expect]]
             [honeysql
              [core :as hsql]
-             [format :as hformat]])
+             [format :as hformat]]
+            [metabase.util.honeysql-extensions :as hx])
   (:import java.util.Locale))
 
 ;; Basic format test not including a specific quoting option
@@ -14,6 +15,47 @@
 (expect
   ["\"SETTING\""]
   (hformat/format :setting :quoting :h2))
+
+;; make sure `identifier` properly handles components with dots and both strings & keywords
+(expect
+  ["`A`.`B`.`C.D`.`E.F`"]
+  (hsql/format (hx/identifier "A" :B "C.D" :E.F)
+    :quoting :mysql))
+
+;; `identifer` should handle slashes
+(expect
+  ["`A/B`.`C\\D`.`E/F`"]
+  (hsql/format (hx/identifier "A/B" "C\\D" :E/F)
+    :quoting :mysql))
+
+;; `identifier` should also handle strings with quotes in them (ANSI)
+(expect
+  ;; two double-quotes to escape, e.g. "A""B"
+  ["\"A\"\"B\""]
+  (hsql/format (hx/identifier "A\"B")
+    :quoting :ansi))
+
+;; `identifier` should also handle strings with quotes in them (MySQL)
+(expect
+  ;; double-backticks to escape backticks seems to be the way to do it
+  ["`A``B`"]
+  (hsql/format (hx/identifier "A`B")
+    :quoting :mysql))
+
+;; `identifier` shouldn't try to change `lisp-case` to `snake-case` or vice-versa
+(expect
+  ["A-B.c-d.D_E.f_g"]
+  (hsql/format (hx/identifier "A-B" :c-d "D_E" :f_g)))
+
+(expect
+  ["\"A-B\".\"c-d\".\"D_E\".\"f_g\""]
+  (hsql/format (hx/identifier "A-B" :c-d "D_E" :f_g)
+    :quoting :ansi))
+
+;; `identifier` should ignore `nil` or empty components.
+(expect
+  ["A.B.C"]
+  (hsql/format (hx/identifier "A" "B" nil "C")))
 
 (defn- call-with-locale
   "Sets the default locale temporarily to `locale-tag`, then invokes `f` and reverts the locale change"

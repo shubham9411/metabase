@@ -1,5 +1,5 @@
 (ns metabase.query-processor.middleware.resolve-joined-tables-test
-  (:require [expectations :refer :all]
+  (:require [expectations :refer [expect]]
             [metabase.query-processor.middleware.resolve-joined-tables :as resolve-joined-tables]
             [metabase.query-processor.test-util :as qp.test-util]
             [metabase.test.data :as data]))
@@ -17,11 +17,13 @@
    :query    (data/$ids venues
                {:source-table $$table
                 :fields       [[:field-id $name]
-                               [:fk-> [:field-id $category_id] [:field-id $categories.name]]]
-                :join-tables  [{:join-alias  "CATEGORIES__via__CATEGORY_ID"
-                                :table-id    (data/id :categories)
-                                :fk-field-id $category_id
-                                :pk-field-id $categories.id}]})}
+                               [:joined-field "CATEGORIES__via__CATEGORY_ID" [:field-id $categories.name]]]
+                :joins        [{:source-table (data/id :categories)
+                                :alias        "CATEGORIES__via__CATEGORY_ID"
+                                :condition    [:=
+                                               [:field-id $category_id]
+                                               [:joined-field "CATEGORIES__via__CATEGORY_ID" [:field-id $categories.id]]]
+                                :strategy     :left-join}]})}
   (resolve-joined-tables
    (data/$ids venues
      {:source-table $$table

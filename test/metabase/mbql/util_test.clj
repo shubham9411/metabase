@@ -189,8 +189,9 @@
    :fields   [[:fk->
                [:datetime-field [:field-id 30] :day]
                [:datetime-field [:field-id 40] :day]]]}
-  (mbql.u/replace a-query [:field-id id]
-                  [:datetime-field [:field-id id] :day]))
+  (mbql.u/replace a-query
+    [:field-id id]
+    [:datetime-field [:field-id id] :day]))
 
 ;; can we wrap the pattern in a map to restrict what gets replaced?
 (expect
@@ -198,7 +199,8 @@
               [:datetime-field [:field-id 20] :day]
               [:field-literal "Wow"]]
    :fields   [[:fk-> [:field-id 30] [:field-id 40]]]}
-  (mbql.u/replace-in a-query [:breakout] [:field-id id]
+  (mbql.u/replace-in a-query [:breakout]
+    [:field-id id]
     [:datetime-field [:field-id id] :day]))
 
 ;; can we use multiple patterns at the same time?!
@@ -214,7 +216,8 @@
               [:field-id 20]
               [:field-literal "Wow"]]
    :fields   [[:fk-> [:field-id 30] [:field-id 100]]]}
-  (mbql.u/replace a-query [:fk-> source [:field-id 40]]
+  (mbql.u/replace a-query
+    [:fk-> source [:field-id 40]]
     [:fk-> source [:field-id 100]]))
 
 ;; can we use `replace` to fix `fk->` clauses where both args are unwrapped IDs?

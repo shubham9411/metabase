@@ -7,7 +7,7 @@
              [util :as u]]
             [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.test.data.interface :as tx]
-            [metabase.util.honeysql-extensions :as hx])
+            [metabase.util.honeysql-extensions.deprecated :as hx.deprecated])
   (:import metabase.test.data.interface.FieldDefinition))
 
 (driver/register! :sql/test-extensions, :abstract? true)
@@ -72,10 +72,10 @@
   (as-> identifier <>
     (u/keyword->qualified-name <>)
     (prepare-identifier driver <>)
-    (hx/escape-dots <>)
+    (hx.deprecated/escape-dots <>)
     (binding [h.format/*allow-dashed-names?* true]
       (h.format/quote-identifier <> :style (sql.qp/quote-style driver)))
-    (hx/unescape-dots <>)))
+    (hx.deprecated/unescape-dots <>)))
 
 
 ;; TODO - what about schemas?
@@ -90,7 +90,7 @@
 
 (defn- quote+combine-names [driver names]
   (s/join \. (for [n names]
-               (name (hx/qualify-and-escape-dots (quote-name driver n))))))
+               (name (hx.deprecated/qualify-and-escape-dots (quote-name driver n))))))
 
 (defmethod qualify+quote-name :sql/test-extensions
   ([driver db-name]

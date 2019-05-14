@@ -552,7 +552,7 @@
   The default implementation is `identity`, meaning the resulting field will have exactly the same name as passed to
   the `:named` clause. Certain drivers like Redshift always lowercase these names, so this method is provided for
   those situations."
-  {:arglists '([driver custom-field-name])}
+  {:arglists '([driver custom-field-name]), :style/indent 1}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 

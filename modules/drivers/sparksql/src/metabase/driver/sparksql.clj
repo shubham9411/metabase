@@ -38,7 +38,7 @@
         table-name       (if (:alias? table)
                            (:name table)
                            source-table-alias)
-        field-identifier (keyword (hx/qualify-and-escape-dots table-name (:name field)))]
+        field-identifier (sql.qp/->honeysql driver (hx/identifier table-name (:name field)))]
     (sql.qp/cast-unix-timestamp-field-if-needed driver field field-identifier)))
 
 (defmethod sql.qp/apply-top-level-clause [:sparksql :page] [_ _ honeysql-form {{:keys [items page]} :page}]
@@ -57,9 +57,9 @@
             (h/limit items))))))
 
 (defmethod sql.qp/apply-top-level-clause [:sparksql :source-table]
-  [_ _ honeysql-form {source-table-id :source-table}]
+  [driver _ honeysql-form {source-table-id :source-table}]
   (let [{table-name :name, schema :schema} (qp.store/table source-table-id)]
-    (h/from honeysql-form [(hx/qualify-and-escape-dots schema table-name) source-table-alias])))
+    (h/from honeysql-form [(sql.qp/->honeysql driver (hx/identifier schema table-name)) source-table-alias])))
 
 
 ;;; ------------------------------------------- Other Driver Method Impls --------------------------------------------

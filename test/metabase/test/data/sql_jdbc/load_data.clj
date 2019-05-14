@@ -9,7 +9,6 @@
             [metabase
              [driver :as driver]
              [util :as u]]
-            [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
             [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.test.data
              [interface :as tx]
@@ -18,9 +17,8 @@
              [execute :as execute]
              [spec :as spec]]
             [metabase.test.data.sql.ddl :as ddl]
-            [metabase.util
-             [date :as du]
-             [honeysql-extensions :as hx]])
+            [metabase.util.date :as du]
+            [metabase.util.honeysql-extensions.deprecated :as hx.deprecated])
   (:import java.sql.SQLException))
 
 (defmulti load-data!
@@ -112,7 +110,7 @@
   "Used by `make-load-data-fn`; creates the actual `insert!` function that gets passed to the `insert-middleware-fns`
   described above."
   [driver conn {:keys [database-name], :as dbdef} {:keys [table-name], :as tabledef}]
-  (let [escaped-table-name (apply hx/qualify-and-escape-dots
+  (let [escaped-table-name (apply hx.deprecated/qualify-and-escape-dots
                                   (sql.tx/qualified-name-components driver database-name table-name))]
     (partial do-insert! driver conn escaped-table-name)))
 
@@ -175,8 +173,7 @@
   [row-or-rows]
   (if (sequential? row-or-rows)
     (map escape-field-names row-or-rows)
-    (into {} (for [[k v] row-or-rows]
-               {(sql-jdbc.common/escape-field-name k) v}))))
+    (m/map-keys #(keyword (hx.deprecated/escape-dots (name %))) row-or-rows)))
 
 ;; default impl
 (defmethod do-insert! :sql-jdbc/test-extensions [driver spec table-name row-or-rows]
@@ -189,10 +186,10 @@
                       (for [value (map row columns)]
                         (sql.qp/->honeysql driver value)))
         hsql-form   (-> (apply h/columns (for [column columns]
-                                           (hx/qualify-and-escape-dots (prepare-key column))))
+                                           (hx.deprecated/qualify-and-escape-dots (prepare-key column))))
                         (h/insert-into (prepare-key table-name))
                         (h/values values))
-        sql+args    (hx/unescape-dots (binding [hformat/*subquery?* false]
+        sql+args    (hx.deprecated/unescape-dots (binding [hformat/*subquery?* false]
                                         (hsql/format hsql-form
                                           :quoting             (sql.qp/quote-style driver)
                                           :allow-dashed-names? true)))]
@@ -211,7 +208,7 @@
   ;; next, get a set of statements for creating the DB & Tables
   (let [statements (apply ddl/create-db-ddl-statements driver dbdef options)]
     ;; exec the combined statement
-    (execute/execute-sql! driver :db dbdef (str/join ";\n" (map hx/unescape-dots statements))))
+    (execute/execute-sql! driver :db dbdef (str/join ";\n" (map hx.deprecated/unescape-dots statements))))
   ;; Now load the data for each Table
   (doseq [tabledef table-definitions]
     (du/profile (format "load-data for %s %s %s" (name driver) (:database-name dbdef) (:table-name tabledef))

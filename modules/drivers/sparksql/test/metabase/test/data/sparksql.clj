@@ -68,10 +68,10 @@
                         (h/values values))
         sql+args    (unprepare/unprepare
                      driver
-                     (hx/unescape-dots (binding [hformat/*subquery?* false]
-                                         (hsql/format hsql-form
-                                           :quoting             (sql.qp/quote-style driver)
-                                           :allow-dashed-names? false))))]
+                     (binding [hformat/*subquery?* false]
+                       (hsql/format hsql-form
+                                    :quoting             (sql.qp/quote-style driver)
+                                    :allow-dashed-names? false)))]
     (with-open [conn (jdbc/get-connection spec)]
       (try
         (.setAutoCommit conn false)

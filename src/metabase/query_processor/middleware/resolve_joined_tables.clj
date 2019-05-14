@@ -7,13 +7,15 @@
             [metabase.mbql
              [schema :as mbql.s]
              [util :as mbql.u]]
+            [metabase.util.i18n :refer [tru]]
             [metabase.models
              [field :refer [Field]]
              [table :refer [Table]]]
             [metabase.query-processor.store :as qp.store]
             [metabase.util.schema :as su]
             [schema.core :as s]
-            [toucan.db :as db]))
+            [toucan.db :as db])
+  (:import metabase.models.field.FieldInstance))
 
 (defn- both-args-are-field-id-clauses? [[_ x y]]
   (and
@@ -27,11 +29,11 @@
 ;;; ------------------------------------------------ Fetching PK Info ------------------------------------------------
 
 (def ^:private PKInfo
-  [{:fk-id     su/IntGreaterThanZero
-    :pk-id    su/IntGreaterThanZero
-    :table-id su/IntGreaterThanZero}])
+  {:fk-id    su/IntGreaterThanZero
+   :pk-id    su/IntGreaterThanZero
+   :table-id su/IntGreaterThanZero})
 
-(s/defn ^:private fk-clauses->pk-info :- PKInfo
+(s/defn ^:private fk-clauses->pk-info :- [PKInfo]
   "Given a `source-table-id` and collection of `fk-field-ids`, return a sequence of maps containing IDs and identifiers
   for those FK fields and their target tables and fields. `fk-field-ids` are IDs of fields that belong to the source
   table. For example, `source-table-id` might be 'checkins' and `fk-field-ids` might have the IDs for 'checkins.user_id'
@@ -69,7 +71,7 @@
 ;;; ------------------------------------ Adding join Table PK fields to the Store ------------------------------------
 
 (s/defn ^:private store-join-table-pk-fields!
-  [pk-info :- PKInfo]
+  [pk-info :- [PKInfo]]
   (let [pk-field-ids (set (map :pk-id pk-info))
         pk-fields    (when (seq pk-field-ids)
                        (db/select (vec (cons Field qp.store/field-columns-to-fetch)) :id [:in pk-field-ids]))]
@@ -77,31 +79,68 @@
       (qp.store/store-field! field))))
 
 
-;;; -------------------------------------- Adding :join-tables key to the query --------------------------------------
+;;; ---------------------------------------- Resolving Join Alias & Condition ----------------------------------------
 
-(s/defn fks->join-information :- [mbql.s/JoinTableInfo]
-  [fk-clauses :- [FKClauseWithFieldIDArgs], pk-info :- PKInfo]
-  (distinct
-   (for [[_ [_ source-id] [_ dest-id]] fk-clauses
-         :let [source-field (qp.store/field source-id)
-               dest-field   (qp.store/field dest-id)
-               table-id     (:table_id dest-field)
-               table        (qp.store/table table-id)
-               pk-id        (some (fn [info]
-                                    (when (and (= (:table-id info) table-id)
-                                               (= (:fk-id info) source-id))
-                                      (:pk-id info)))
-                                  pk-info)]]
-     ;; some DBs like Oracle limit the length of identifiers to 30 characters so only take
-     ;; the first 30 here
-     {:join-alias  (apply str (take 30 (str (:name table) "__via__" (:name source-field))))
-      :table-id    table-id
-      :fk-field-id source-id
-      :pk-field-id pk-id})))
+(def ^:private ResolvedJoinInfo
+  {:fk-clause    FKClauseWithFieldIDArgs
+   :source-table su/IntGreaterThanZero
+   :alias        su/NonBlankString
+   :condition    mbql.s/Filter})
 
-(s/defn ^:private add-join-info-to-query :- mbql.s/Query
-  [query fk-clauses pk-info]
-  (assoc-in query [:query :join-tables] (fks->join-information fk-clauses pk-info)))
+(s/defn ^:private resolve-one-join-info :- ResolvedJoinInfo
+  [[_ [_ source-id] [_ dest-id] :as fk-clause] :- FKClauseWithFieldIDArgs, pk-info :- [PKInfo]]
+  (let [source-field (qp.store/field source-id)
+        dest-field   (qp.store/field dest-id)
+        table-id     (:table_id dest-field)
+        table        (qp.store/table table-id)
+        pk-id        (some (fn [info]
+                             (when (and (= (:table-id info) table-id)
+                                        (= (:fk-id info) source-id))
+                               (:pk-id info)))
+                           pk-info)
+        ;; some DBs like Oracle limit the length of identifiers to 30 characters so only take the first 30 here
+        alias        (apply str (take 30 (str (:name table) "__via__" (:name source-field))))]
+    {:fk-clause    fk-clause
+     :source-table table-id
+     :alias        alias
+     :condition    [:= [:field-id source-id] [:joined-field alias [:field-id pk-id]]]}))
+
+(s/defn ^:private resolve-join-info :- [ResolvedJoinInfo]
+  [fk-clauses :- [FKClauseWithFieldIDArgs], pk-info :- [PKInfo]]
+  (map #(resolve-one-join-info % pk-info)
+       fk-clauses))
+
+
+;;; ------------------------------------------- Adding :joins to the query -------------------------------------------
+
+(s/defn ^:private resolved-join-info->join-clause :- mbql.s/Join
+  [{:keys [source-table alias condition]} :- ResolvedJoinInfo]
+  {:source-table source-table
+   :alias        alias
+   :condition    condition
+   :strategy     :left-join})
+
+(s/defn ^:private add-implicit-join-clauses :- mbql.s/Query
+  [query, resolved-join-infos :- [ResolvedJoinInfo]]
+  (update-in query [:query :joins] concat (map resolved-join-info->join-clause resolved-join-infos)))
+
+
+;;; --------------------------------------------- Replacing fk-> clauses ---------------------------------------------
+
+(s/defn ^:private matching-resolved-info :- ResolvedJoinInfo
+  [query-fk-clause :- mbql.s/fk->, resolved-join-info :- [ResolvedJoinInfo]]
+  (or (some
+       (fn [{info-fk-clause :fk-clause, :as info}]
+         (when (= query-fk-clause info-fk-clause)
+           info))
+       resolved-join-info)
+      (throw (Exception. (str (tru "Did not find match for {0} in resolved info." query-fk-clause))))))
+
+(s/defn ^:private replace-fk-clauses :- mbql.s/Query
+  [query, resolved-join-info :- [ResolvedJoinInfo]]
+  (mbql.u/replace-in query [:query]
+    [:fk-> _ [_ dest-id]] (let [{:keys [alias]} (matching-resolved-info &match resolved-join-info)]
+                            [:joined-field alias [:field-id dest-id]])))
 
 
 ;;; -------------------------------------------- PUTTING it all together ---------------------------------------------
@@ -120,7 +159,10 @@
       (let [pk-info (fk-clauses->pk-info source-table-id fk-clauses)]
         (store-join-tables! fk-clauses)
         (store-join-table-pk-fields! pk-info)
-        (add-join-info-to-query query fk-clauses pk-info)))))
+        (let [resolved-join-info (resolve-join-info fk-clauses pk-info)]
+          (-> query
+              (add-implicit-join-clauses resolved-join-info)
+              (replace-fk-clauses resolved-join-info)))))))
 
 (defn- resolve-joined-tables-in-query-all-levels
   "Resolve JOINs at all levels of the query, including the top level and nested queries at any level of nesting."
