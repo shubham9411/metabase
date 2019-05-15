@@ -137,20 +137,24 @@ export default class LoginApp extends Component {
                   <div className="relative border-bottom pb4">
                     <SSOLoginButton provider="google" ref="ssoLoginButton" />
                     {/*<div className="g-signin2 ml1 relative z2" id="g-signin2"></div>*/}
-                    <div
-                      className="mx1 absolute text-centered left right"
-                      style={{ bottom: -8 }}
-                    >
-                      <span className="text-bold px3 py2 text-medium bg-white">{t`OR`}</span>
+                    { !preferUsernameAndPassword ||
+                      <div
+                        className="mx1 absolute text-centered left right"
+                        style={{ bottom: -8 }}
+                      >
+                        <span className="text-bold px3 py2 text-medium bg-white">{t`OR`}</span>
+                      </div>
+                    }
+                  </div>
+                  { !preferUsernameAndPassword ||
+                    <div className="py3 ">
+                      <Link to="/auth/login?useMBLogin=true">
+                        <Button className="EmailSignIn full py2">
+                          {t`Sign in with email`}
+                        </Button>
+                      </Link>
                     </div>
-                  </div>
-                  <div className="py3">
-                    <Link to="/auth/login?useMBLogin=true">
-                      <Button className="EmailSignIn full py2">
-                        {t`Sign in with email`}
-                      </Button>
-                    </Link>
-                  </div>
+                  }
                 </div>
               )}
 
