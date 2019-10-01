@@ -45,7 +45,7 @@ RUN yarn
 COPY . .
 
 # build the app
-RUN INTERACTIVE=false bin/build
+RUN bin/build no-translations
 
 # import AWS RDS cert into /etc/ssl/certs/java/cacerts
 ADD https://s3.amazonaws.com/rds-downloads/rds-combined-ca-bundle.pem .
