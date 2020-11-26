@@ -20,7 +20,7 @@ const GOOGLE_PROVIDER = {
 
 PLUGIN_AUTH_PROVIDERS.push(providers =>
   MetabaseSettings.googleAuthEnabled()
-    ? [GOOGLE_PROVIDER, ...providers]
+    ? [GOOGLE_PROVIDER]
     : providers,
 );
 
